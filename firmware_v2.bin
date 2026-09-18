@@ -1,0 +1,364 @@
+/*
+ * ========================================================
+ * PROJETO MOTIVA - Firmware 2.0
+ * Monitoramento de vegetacao com atualizacao remota (OTA)
+ * S2-CP02 - FIAP NEXT
+ * ========================================================
+ *
+ * Evolucao em relacao ao Firmware 1.0:
+ *  - Mantem as 5 leituras por sessao (2s de intervalo) e a media
+ *  - Ordena uma copia das leituras (ordenacao implementada
+ *    manualmente - bubble sort) e exibe original + ordenada
+ *  - Calcula a MEDIANA (3o elemento do vetor ordenado de 5)
+ *  - Implementa histerese baseada na mediana da sessao:
+ *      mediana >= 16 cm            -> ALERTA
+ *      14 cm  <  mediana < 16 cm   -> mantem o estado anterior
+ *      mediana <= 14 cm            -> NORMAL
+ *  - Atualiza o LED conforme o estado (verde = NORMAL, vermelho = ALERTA)
+ *  - MANTEM o mecanismo de consulta/download/atualizacao OTA,
+ *    para que uma futura versao 3.0 ainda possa ser recebida.
+ *
+ * Bibliotecas externas usadas:
+ *  - ArduinoJson: parsing seguro do version.json.
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
+#include <ArduinoJson.h>
+
+// ---------------- CONFIGURACOES GERAIS ----------------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+
+const char* FW_VERSION = "2.0";
+
+// Ajuste para o seu usuario/repositorio no GitHub:
+const char* MANIFEST_URL =
+  "https://raw.githubusercontent.com/FernandoCairess/Atualizacao_OTA/main/version.json";
+
+// ---------------- LED RGB (indicacao de estado) ----------------
+const int LED_R = 25;
+const int LED_G = 26;
+const int LED_B = 27;
+
+// ---------------- PARAMETROS DE SESSAO ----------------
+const int NUM_LEITURAS = 5;
+const unsigned long INTERVALO_LEITURA_MS = 2000;
+const unsigned long INTERVALO_SESSAO_MS  = 48000;
+const int SESSOES_MINIMAS_ANTES_OTA = 3;
+
+float leituras[NUM_LEITURAS];
+float leiturasOrdenadas[NUM_LEITURAS];
+
+unsigned long inicioSessaoAnterior = 0;
+int numeroSessao = 0;
+
+// ---------------- ESTADO DE HISTERESE ----------------
+enum EstadoVegetacao { NORMAL, ALERTA };
+EstadoVegetacao estadoAtual = NORMAL; // estado inicial
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  configurarLED();
+  indicarEstado(); // mostra o estado inicial (NORMAL = verde)
+
+  Serial.println("========================================");
+  Serial.println("MONITORAMENTO DE VEGETACAO - FW 2.0");
+  Serial.println("========================================");
+
+  conectarWiFi();
+
+  randomSeed(esp_random());
+
+  inicioSessaoAnterior = millis();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  bool primeiraSessao = (numeroSessao == 0);
+
+  if (primeiraSessao || (millis() - inicioSessaoAnterior >= INTERVALO_SESSAO_MS)) {
+    inicioSessaoAnterior = millis();
+    numeroSessao++;
+
+    executarSessaoDeLeitura();
+
+    if (numeroSessao >= SESSOES_MINIMAS_ANTES_OTA) {
+      verificarAtualizacao();
+    }
+
+    Serial.println("Proxima sessao em 48 segundos.");
+    Serial.println();
+  }
+}
+
+// ---------------- WIFI ----------------
+void conectarWiFi() {
+  Serial.print("Conectando ao WiFi (");
+  Serial.print(WIFI_SSID);
+  Serial.print(")");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("ERRO: nao foi possivel conectar ao WiFi.");
+  }
+}
+
+bool wifiConectado() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// ---------------- SESSAO DE LEITURA ----------------
+void executarSessaoDeLeitura() {
+  Serial.print("--- Sessao ");
+  Serial.print(numeroSessao);
+  Serial.println(" ---");
+
+  for (int i = 0; i < NUM_LEITURAS; i++) {
+    leituras[i] = gerarLeituraSimulada();
+    Serial.print("Leitura ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(leituras[i], 0);
+    Serial.println(" cm");
+
+    if (i < NUM_LEITURAS - 1) {
+      delay(INTERVALO_LEITURA_MS);
+    }
+  }
+
+  float media = calcularMedia(leituras, NUM_LEITURAS);
+
+  ordenarCopia(leituras, leiturasOrdenadas, NUM_LEITURAS);
+  float mediana = calcularMediana(leiturasOrdenadas);
+
+  imprimirVetor("Ordem original: ", leituras, NUM_LEITURAS);
+  imprimirVetor("Ordem crescente: ", leiturasOrdenadas, NUM_LEITURAS);
+
+  Serial.print("Media da sessao: ");
+  Serial.print(media, 1);
+  Serial.println(" cm");
+
+  Serial.print("Mediana da sessao: ");
+  Serial.print(mediana, 0);
+  Serial.println(" cm");
+
+  atualizarHisterese(mediana);
+}
+
+float gerarLeituraSimulada() {
+  return random(10, 21); // 10 a 20 cm
+}
+
+float calcularMedia(float valores[], int tamanho) {
+  float soma = 0;
+  for (int i = 0; i < tamanho; i++) {
+    soma += valores[i];
+  }
+  return soma / tamanho;
+}
+
+// Ordenacao manual (bubble sort) em ordem crescente, sem alterar o original
+void ordenarCopia(float origem[], float destino[], int tamanho) {
+  for (int i = 0; i < tamanho; i++) {
+    destino[i] = origem[i];
+  }
+  for (int i = 0; i < tamanho - 1; i++) {
+    for (int j = 0; j < tamanho - 1 - i; j++) {
+      if (destino[j] > destino[j + 1]) {
+        float temp = destino[j];
+        destino[j] = destino[j + 1];
+        destino[j + 1] = temp;
+      }
+    }
+  }
+}
+
+// Para 5 valores ordenados, a mediana e o 3o elemento (indice 2)
+float calcularMediana(float valoresOrdenados[]) {
+  return valoresOrdenados[2];
+}
+
+void imprimirVetor(const char* rotulo, float valores[], int tamanho) {
+  Serial.print(rotulo);
+  for (int i = 0; i < tamanho; i++) {
+    Serial.print(valores[i], 0);
+    if (i < tamanho - 1) Serial.print(", ");
+  }
+  Serial.println(" cm");
+}
+
+// ---------------- HISTERESE ----------------
+void atualizarHisterese(float mediana) {
+  if (mediana >= 16.0) {
+    estadoAtual = ALERTA;
+  } else if (mediana <= 14.0) {
+    estadoAtual = NORMAL;
+  }
+  // Entre 14 e 16 (exclusive): mantem o estado anterior, nao altera nada.
+
+  Serial.print("Estado do sistema: ");
+  Serial.println(estadoAtual == ALERTA ? "ALERTA" : "NORMAL");
+
+  indicarEstado();
+}
+
+// ---------------- LED RGB ----------------
+void configurarLED() {
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  apagarLED();
+}
+
+void apagarLED() {
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_B, LOW);
+}
+
+void indicarEstado() {
+  if (estadoAtual == ALERTA) {
+    // Vermelho = ALERTA
+    digitalWrite(LED_R, HIGH);
+    digitalWrite(LED_G, LOW);
+    digitalWrite(LED_B, LOW);
+  } else {
+    // Verde = NORMAL
+    digitalWrite(LED_R, LOW);
+    digitalWrite(LED_G, HIGH);
+    digitalWrite(LED_B, LOW);
+  }
+}
+
+// ---------------- VERIFICACAO DE ATUALIZACAO (OTA) ----------------
+// Mantido identico ao Firmware 1.0: toda versao precisa continuar
+// capaz de receber a proxima atualizacao (ex.: uma futura v3.0).
+void verificarAtualizacao() {
+  if (!wifiConectado()) {
+    Serial.println("[OTA] Sem conexao WiFi. Nao e possivel checar atualizacoes.");
+    return;
+  }
+
+  Serial.println("[OTA] Consultando manifesto de versao...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, MANIFEST_URL)) {
+    Serial.println("[OTA] ERRO: nao foi possivel iniciar conexao com o manifesto.");
+    return;
+  }
+
+  int codigo = http.GET();
+  if (codigo != HTTP_CODE_OK) {
+    Serial.print("[OTA] ERRO: manifesto inacessivel. Codigo HTTP: ");
+    Serial.println(codigo);
+    http.end();
+    return;
+  }
+
+  String corpo = http.getString();
+  http.end();
+
+  StaticJsonDocument<256> doc;
+  DeserializationError erro = deserializeJson(doc, corpo);
+  if (erro) {
+    Serial.print("[OTA] ERRO ao interpretar version.json: ");
+    Serial.println(erro.c_str());
+    return;
+  }
+
+  String versaoDisponivel = doc["version"].as<String>();
+  String urlFirmware = doc["url"].as<String>();
+
+  Serial.print("[OTA] Minha versao: ");
+  Serial.println(FW_VERSION);
+  Serial.print("[OTA] Versao disponivel no repositorio: ");
+  Serial.println(versaoDisponivel);
+
+  if (versaoDisponivel == FW_VERSION) {
+    Serial.println("[OTA] A versao instalada ja e a mais recente.");
+    return;
+  }
+
+  Serial.println("[OTA] Nova versao detectada! Iniciando atualizacao...");
+  baixarEAtualizar(urlFirmware);
+}
+
+void baixarEAtualizar(const String& urlFirmware) {
+  if (urlFirmware.length() == 0) {
+    Serial.println("[OTA] ERRO: URL do firmware nao informada no manifesto.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, urlFirmware)) {
+    Serial.println("[OTA] ERRO: nao foi possivel iniciar download do firmware.");
+    return;
+  }
+
+  int codigo = http.GET();
+  if (codigo != HTTP_CODE_OK) {
+    Serial.print("[OTA] ERRO: falha ao baixar firmware. Codigo HTTP: ");
+    Serial.println(codigo);
+    http.end();
+    return;
+  }
+
+  int tamanho = http.getSize();
+  Serial.print("[OTA] Firmware recebido. Tamanho: ");
+  Serial.print(tamanho);
+  Serial.println(" bytes");
+
+  if (!Update.begin(tamanho > 0 ? tamanho : UPDATE_SIZE_UNKNOWN)) {
+    Serial.println("[OTA] ERRO: nao foi possivel iniciar a gravacao OTA.");
+    Update.printError(Serial);
+    http.end();
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t gravado = Update.writeStream(*stream);
+  Serial.print("[OTA] Bytes gravados: ");
+  Serial.println(gravado);
+
+  if (!Update.end()) {
+    Serial.println("[OTA] ERRO: falha ao finalizar a atualizacao.");
+    Update.printError(Serial);
+    http.end();
+    return;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("[OTA] ERRO: atualizacao incompleta.");
+    http.end();
+    return;
+  }
+
+  http.end();
+  Serial.println("[OTA] Atualizacao concluida com sucesso! Reiniciando...");
+  delay(500);
+  ESP.restart();
+}
